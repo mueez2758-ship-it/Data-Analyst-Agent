@@ -1,45 +1,72 @@
-
+﻿
 # ============================================================
 # PROJECT: Data Analyst Agent
 # FILE: app/main.py
-# VERSION: 0.3.1
-# PURPOSE:
-# 1. Start the FastAPI backend.
-# 2. Accept CSV and Excel dataset uploads.
-# 3. Generate statistical analysis.
-# 4. Check dataset quality.
-# 5. Generate automatic descriptive insights.
-# 6. Return structured JSON reports.
-# 7. Document the response correctly in Swagger.
+# VERSION: 0.3.5
+#
+# FEATURES:
+# 1. FastAPI application
+# 2. CSV, XLSX, and XLS uploads
+# 3. Statistical analysis
+# 4. Data quality assessment
+# 5. Automated insights and recommendations
+# 6. Automatic dashboard generation
+# 7. Persistent dataset-named projects and saved reports
+# 8. New Project support
+# 9. Project, feature-engineering, and prediction APIs
+# 10. Upload validation and safe HTTP error handling
 # ============================================================
 
 from io import BytesIO
 from pathlib import Path
 from typing import Any
+import logging
 import math
 
 import numpy as np
 import pandas as pd
-
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel
 
+from app.dashboard import generate_dashboard
 from app.data_quality import assess_data_quality
 from app.insights import generate_insights
+from app.project_store import (
+    create_project,
+    get_or_create_project,
+    get_project,
+    save_project_report,
+)
+
+# Register each API router exactly once.
+from app.project_api import router as project_router
+from app.feature_api import router as feature_router
+from app.prediction_api import router as prediction_router
 
 
 # ============================================================
-# 1. CREATE THE FASTAPI APPLICATION
+# 1. APPLICATION CONFIGURATION
 # ============================================================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 
 app = FastAPI(
     title="Data Analyst Agent",
     description=(
-        "Automated data analysis, data quality checks, "
-        "insights, predictions, SQL, and dashboards."
+        "Automated data analysis, data quality checks, insights, "
+        "feature engineering, predictions, SQL, and dashboards."
     ),
-    version="0.3.1",
+    version="0.3.5",
 )
+
+app.include_router(project_router)
+app.include_router(feature_router)
+app.include_router(prediction_router)
 
 
 # ============================================================
@@ -47,33 +74,27 @@ app = FastAPI(
 # ============================================================
 
 class DatasetAnalysisResponse(BaseModel):
-    """Structure of a successful dataset analysis response."""
+    """Structure returned after successful dataset analysis."""
 
     filename: str
     file_size_bytes: int
     analysis: dict[str, Any]
     data_quality: dict[str, Any]
     insights: dict[str, Any]
+    dashboard: dict[str, Any]
     notice: str
+    saved_report: dict[str, Any] | None = None
+    feature_engineering: dict[str, Any] | None = None
 
 
 # ============================================================
-# 3. APPLICATION CONFIGURATION
-# ============================================================
-
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-
-ALLOWED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
-
-
-# ============================================================
-# 4. HELPER: CONVERT VALUES INTO JSON-SAFE VALUES
+# 3. JSON-SAFE VALUE CONVERSION
 # ============================================================
 
 def clean_value(value: Any) -> Any:
-    """Convert Pandas and NumPy values into JSON-safe values."""
+    """Convert NumPy/Pandas values into JSON-safe Python values."""
 
-    if value is None:
+    if value is None or value is pd.NA or value is pd.NaT:
         return None
 
     if isinstance(value, np.bool_):
@@ -89,21 +110,32 @@ def clean_value(value: Any) -> Any:
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
 
+    if isinstance(value, np.ndarray):
+        return [clean_value(item) for item in value.tolist()]
+
     try:
-        if pd.isna(value):
+        missing = pd.isna(value)
+        if isinstance(missing, (bool, np.bool_)) and missing:
             return None
     except (TypeError, ValueError):
         pass
+
+    # Convert other NumPy scalar types where possible.
+    if isinstance(value, np.generic):
+        return value.item()
 
     return value
 
 
 # ============================================================
-# 5. STATISTICAL ANALYSIS
+# 4. STATISTICAL ANALYSIS
 # ============================================================
 
 def analyze_dataframe(df: pd.DataFrame) -> dict[str, Any]:
-    """Generate statistical summaries for a dataset."""
+    """Generate descriptive statistics for a DataFrame."""
+
+    if not isinstance(df, pd.DataFrame):
+        raise ValueError("The input must be a Pandas DataFrame.")
 
     numeric_df = df.select_dtypes(include="number")
 
@@ -114,20 +146,10 @@ def analyze_dataframe(df: pd.DataFrame) -> dict[str, Any]:
     numeric_summary: dict[str, Any] = {}
     categorical_summary: dict[str, Any] = {}
 
-    # --------------------------------------------------------
-    # 5.1 NUMERICAL STATISTICS
-    # --------------------------------------------------------
-
+    # Numerical statistics.
     for column in numeric_df.columns:
-        series = pd.to_numeric(
-            numeric_df[column],
-            errors="coerce",
-        )
-
-        series = series.replace(
-            [np.inf, -np.inf],
-            np.nan,
-        ).dropna()
+        series = pd.to_numeric(df[column], errors="coerce")
+        series = series.replace([np.inf, -np.inf], np.nan).dropna()
 
         numeric_summary[str(column)] = {
             "count": int(series.count()),
@@ -138,10 +160,7 @@ def analyze_dataframe(df: pd.DataFrame) -> dict[str, Any]:
             "standard_deviation": clean_value(series.std()),
         }
 
-    # --------------------------------------------------------
-    # 5.2 CATEGORICAL SUMMARIES
-    # --------------------------------------------------------
-
+    # Most frequent categorical values.
     for column in categorical_df.columns:
         top_values = (
             df[column]
@@ -159,36 +178,23 @@ def analyze_dataframe(df: pd.DataFrame) -> dict[str, Any]:
             for value, count in top_values.items()
         ]
 
-    # --------------------------------------------------------
-    # 5.3 MISSING VALUES
-    # --------------------------------------------------------
-
+    # Missing values by column.
     missing_values = {
         str(column): int(count)
         for column, count in df.isna().sum().items()
         if count > 0
     }
 
-    # --------------------------------------------------------
-    # 5.4 COLUMN DATA TYPES
-    # --------------------------------------------------------
-
+    # Column data types.
     column_types = {
         str(column): str(dtype)
         for column, dtype in df.dtypes.items()
     }
 
-    # --------------------------------------------------------
-    # 5.5 DUPLICATE ROWS
-    # --------------------------------------------------------
-
     duplicate_count = int(df.duplicated().sum())
 
-    # --------------------------------------------------------
-    # 5.6 INITIAL FINDINGS
-    # --------------------------------------------------------
-
-    findings = []
+    # Initial findings.
+    findings: list[str] = []
 
     if df.empty:
         findings.append("The dataset contains no data rows.")
@@ -227,11 +233,92 @@ def analyze_dataframe(df: pd.DataFrame) -> dict[str, Any]:
 
 
 # ============================================================
+# 5. DATASET LOADING AND VALIDATION
+# ============================================================
+
+def load_dataset(filename: str, content: bytes) -> pd.DataFrame:
+    """Load a validated CSV or Excel file into a DataFrame."""
+
+    extension = Path(filename).suffix.lower()
+
+    try:
+        if extension == ".csv":
+            # utf-8-sig also handles CSV files with a BOM.
+            try:
+                df = pd.read_csv(BytesIO(content), encoding="utf-8-sig")
+            except UnicodeDecodeError:
+                df = pd.read_csv(BytesIO(content), encoding="latin-1")
+
+        elif extension == ".xlsx":
+            df = pd.read_excel(
+                BytesIO(content),
+                engine="openpyxl",
+            )
+
+        elif extension == ".xls":
+            df = pd.read_excel(
+                BytesIO(content),
+                engine="xlrd",
+            )
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Upload a CSV, XLSX, or XLS file.",
+            )
+
+    except HTTPException:
+        raise
+
+    except ImportError as exc:
+        logger.exception("A dataset-reading dependency is missing")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "A required file-reading dependency is missing. "
+                "Install openpyxl for XLSX files and xlrd for XLS files."
+            ),
+        ) from exc
+
+    except (
+        UnicodeDecodeError,
+        pd.errors.ParserError,
+        pd.errors.EmptyDataError,
+        ValueError,
+        OSError,
+        EOFError,
+    ) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Could not read the uploaded file. Check that it is "
+                "a valid, non-corrupted CSV or Excel dataset."
+            ),
+        ) from exc
+
+    if len(df.columns) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="The dataset contains no columns.",
+        )
+
+    if not df.columns.is_unique:
+        raise HTTPException(
+            status_code=400,
+            detail="Column names must be unique.",
+        )
+
+    return df
+
+
+# ============================================================
 # 6. HOME ENDPOINT
 # ============================================================
 
 @app.get("/", summary="Home")
 def home() -> dict[str, str]:
+    """Return basic API information."""
+
     return {
         "message": "Welcome to Data Analyst Agent",
         "status": "running",
@@ -249,37 +336,53 @@ def home() -> dict[str, str]:
     response_model=DatasetAnalysisResponse,
     summary="Analyze Dataset",
     description=(
-        "Upload a CSV or Excel file to generate statistical "
-        "analysis, data quality checks, and automated insights."
+        "Upload a CSV or Excel file to generate statistical analysis, "
+        "data quality checks, insights, KPIs, and dashboard charts. "
+        "The report is saved to a persistent project."
     ),
     responses={
         400: {"description": "Invalid or unsupported dataset."},
+        404: {"description": "Selected project was not found."},
         413: {"description": "Uploaded file exceeds 25 MB."},
         500: {"description": "Dataset analysis failed."},
     },
 )
 async def analyze_dataset(
     file: UploadFile = File(...),
+    project_id: str | None = Form(default=None),
+    new_project: bool = Form(default=False),
 ) -> DatasetAnalysisResponse:
-
-    filename = Path(file.filename or "").name
-    extension = Path(filename).suffix.lower()
-
-    # --------------------------------------------------------
-    # 7.1 VALIDATE FILE EXTENSION
-    # --------------------------------------------------------
-
-    if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail="Upload a CSV, XLSX, or XLS file.",
-        )
+    """Analyze an uploaded dataset and save the report."""
 
     try:
-        # ----------------------------------------------------
-        # 7.2 READ UPLOAD IN CHUNKS
-        # ----------------------------------------------------
+        # Validate the filename and extension.
+        filename = Path(file.filename or "").name
+        extension = Path(filename).suffix.lower()
 
+        if not filename or extension not in ALLOWED_EXTENSIONS:
+            raise HTTPException(
+                status_code=400,
+                detail="Upload a CSV, XLSX, or XLS file.",
+            )
+
+        # An empty project_id from a multipart form means no selection.
+        project_id = (project_id or "").strip() or None
+
+        # Validate the selected project unless a new one was requested.
+        if (
+            project_id is not None
+            and not new_project
+            and get_project(project_id) is None
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "Project not found. Select an existing project "
+                    "or enable New Project."
+                ),
+            )
+
+        # Read in chunks and enforce the upload limit.
         chunks: list[bytes] = []
         total_bytes = 0
 
@@ -307,113 +410,91 @@ async def analyze_dataset(
 
         content = b"".join(chunks)
 
-        # ----------------------------------------------------
-        # 7.3 LOAD CSV OR EXCEL
-        # ----------------------------------------------------
+        # Load and validate the dataset.
+        df = load_dataset(filename, content)
 
-        try:
-            if extension == ".csv":
-                df = pd.read_csv(BytesIO(content))
-
-            elif extension == ".xlsx":
-                df = pd.read_excel(
-                    BytesIO(content),
-                    engine="openpyxl",
-                )
-
-            else:
-                df = pd.read_excel(
-                    BytesIO(content),
-                    engine="xlrd",
-                )
-
-        except ImportError as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "An Excel dependency is missing. Install "
-                    "openpyxl for XLSX or xlrd for XLS files."
-                ),
-            ) from exc
-
-        except (
-            UnicodeDecodeError,
-            pd.errors.ParserError,
-            ValueError,
-            OSError,
-        ) as exc:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Could not read the file. Check that it is "
-                    "a valid CSV or Excel dataset."
-                ),
-            ) from exc
-
-        # ----------------------------------------------------
-        # 7.4 VALIDATE DATASET STRUCTURE
-        # ----------------------------------------------------
-
-        if len(df.columns) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="The dataset contains no columns.",
-            )
-
-        if not df.columns.is_unique:
-            raise HTTPException(
-                status_code=400,
-                detail="Column names must be unique.",
-            )
-
-        # ----------------------------------------------------
-        # 7.5 GENERATE STATISTICAL ANALYSIS
-        # ----------------------------------------------------
-
+        # Run analysis modules against the uploaded data.
         analysis_report = analyze_dataframe(df)
-
-        # ----------------------------------------------------
-        # 7.6 CHECK DATA QUALITY
-        # ----------------------------------------------------
-
         quality_report = assess_data_quality(df)
-
-        # ----------------------------------------------------
-        # 7.7 GENERATE AUTOMATIC INSIGHTS
-        # ----------------------------------------------------
-
         insights_report = generate_insights(df)
+        dashboard_report = generate_dashboard(df)
 
-        # ----------------------------------------------------
-        # 7.8 RETURN STRUCTURED JSON
-        # ----------------------------------------------------
-
-        return DatasetAnalysisResponse(
+        response = DatasetAnalysisResponse(
             filename=filename,
             file_size_bytes=total_bytes,
             analysis=analysis_report,
             data_quality=quality_report,
             insights=insights_report,
+            dashboard=dashboard_report,
             notice=(
-                "These reports describe the uploaded data. "
-                "They do not guarantee data correctness "
-                "or prediction accuracy."
+                "Reports describe the uploaded dataset. "
+                "They do not guarantee data correctness or prediction "
+                "accuracy. Review data quality warnings before making "
+                "business decisions."
             ),
         )
 
+        # Build a readable project name from the dataset filename.
+        project_name = " ".join(Path(filename).stem.split())[:120]
+        project_name = project_name or "Untitled Dataset"
+
+        # Create a separate project when explicitly requested.
+        if new_project:
+            project = create_project(project_name)
+            project_id = project["id"]
+
+        # Reuse the selected project when supplied.
+        elif project_id is not None:
+            project = get_project(project_id)
+
+            if project is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="The selected project no longer exists.",
+                )
+
+        # Otherwise, reuse or create a project named after the dataset.
+        else:
+            project = get_or_create_project(project_name)
+            project_id = project["id"]
+
+        # Prepare a JSON-safe report for SQLite storage.
+        report_data = jsonable_encoder(
+            response,
+            exclude={"saved_report"},
+        )
+
+        saved_record = save_project_report(
+            project_id=project_id,
+            dataset_name=filename,
+            report=report_data,
+        )
+
+        if saved_record is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Project not found while saving the report.",
+            )
+
+        response.saved_report = saved_record
+
+        return response
+
     except HTTPException:
+        # Keep deliberate HTTP status codes and messages.
         raise
 
     except Exception as exc:
-        print(f"Dataset analysis error: {exc}")
+        logger.exception("Dataset analysis failed")
 
         raise HTTPException(
             status_code=500,
             detail=(
-                "Dataset analysis failed. "
-                "Check the server terminal for details."
+                "Dataset analysis failed. Check the server terminal "
+                "for the technical error."
             ),
         ) from exc
 
     finally:
+        # Close the upload even when processing fails.
         await file.close()
