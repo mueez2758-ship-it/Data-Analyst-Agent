@@ -1,0 +1,392 @@
+﻿
+"""Feature engineering and data-cleaning utilities."""
+
+from __future__ import annotations
+
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+
+CATEGORICAL_TYPES = ["object", "category", "string", "bool"]
+NUMERIC_TYPES = ["number"]
+
+
+def _unique_column_name(
+    desired_name: str,
+    existing_columns: set[str],
+) -> str:
+    """Return a unique name without overwriting existing data."""
+    name = desired_name
+    counter = 1
+
+    while name in existing_columns:
+        name = f"{desired_name}_{counter}"
+        counter += 1
+
+    existing_columns.add(name)
+    return name
+
+
+def _json_safe_number(value: Any) -> int | float | None:
+    """Convert a numeric value to a JSON-safe Python value."""
+    if value is None or pd.isna(value):
+        return None
+
+    number = float(value)
+
+    if not np.isfinite(number):
+        return None
+
+    if number.is_integer():
+        return int(number)
+
+    return number
+
+
+def _missing_summary(df: pd.DataFrame) -> dict[str, int]:
+    """Count remaining missing values by column."""
+    return {
+        str(column): int(count)
+        for column, count in df.isna().sum().items()
+        if count > 0
+    }
+
+
+def _is_missing_or_infinite(series: pd.Series) -> pd.Series:
+    """Identify missing values, including numeric infinity."""
+    missing = series.isna()
+
+    if pd.api.types.is_numeric_dtype(series.dtype):
+        missing = missing | series.isin([np.inf, -np.inf])
+
+    return missing
+
+
+def engineer_features(
+    df: pd.DataFrame,
+    *,
+    drop_duplicates: bool = False,
+    fill_numeric_missing: bool = False,
+    fill_categorical_missing: bool = False,
+    encode_categoricals: bool = False,
+    extract_date_features: bool = False,
+    numeric_fill_method: str = "median",
+    numeric_fill_value: float = 0,
+    categorical_fill_method: str = "unknown",
+    drop_identical_columns: bool = False,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Transform a copy of a DataFrame and return a detailed summary.
+
+    Numeric fill methods: median, mean, constant.
+    Categorical fill methods: unknown, mode.
+
+    The input DataFrame is never modified.
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("Input must be a pandas DataFrame.")
+
+    if not df.columns.is_unique:
+        raise ValueError("Column names must be unique.")
+
+    if any(not isinstance(column, str) for column in df.columns):
+        raise ValueError("All column names must be strings.")
+
+    numeric_fill_method = numeric_fill_method.strip().lower()
+    categorical_fill_method = categorical_fill_method.strip().lower()
+
+    if numeric_fill_method not in {"median", "mean", "constant"}:
+        raise ValueError(
+            "numeric_fill_method must be 'median', 'mean', or 'constant'."
+        )
+
+    if categorical_fill_method not in {"unknown", "mode"}:
+        raise ValueError(
+            "categorical_fill_method must be 'unknown' or 'mode'."
+        )
+
+    try:
+        numeric_fill_value = float(numeric_fill_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("numeric_fill_value must be a finite number.") from exc
+
+    if not np.isfinite(numeric_fill_value):
+        raise ValueError("numeric_fill_value must be a finite number.")
+
+    result = df.copy(deep=True)
+    original_rows, original_columns = result.shape
+    changes: list[str] = []
+    cleaning_summary: dict[str, Any] = {
+        "numeric_values_filled": 0,
+        "categorical_values_filled": 0,
+        "infinite_values_replaced": 0,
+        "duplicate_rows_removed": 0,
+        "identical_columns_removed": [],
+        "numeric_fill_by_column": {},
+        "categorical_fill_by_column": {},
+    }
+
+    # 1. Remove duplicate rows if requested.
+    if drop_duplicates:
+        before = len(result)
+        result = result.drop_duplicates().reset_index(drop=True)
+        removed = before - len(result)
+        cleaning_summary["duplicate_rows_removed"] = int(removed)
+        changes.append(f"Removed {removed} duplicate row(s).")
+
+    # 2. Optionally remove columns with identical values.
+    if drop_identical_columns:
+        removed_columns: list[str] = []
+        kept_columns: list[str] = []
+
+        for column in result.columns:
+            identical_to_kept = any(
+                result[column].equals(result[kept])
+                for kept in kept_columns
+            )
+
+            if identical_to_kept:
+                removed_columns.append(column)
+            else:
+                kept_columns.append(column)
+
+        if removed_columns:
+            result = result.drop(columns=removed_columns)
+
+        cleaning_summary["identical_columns_removed"] = removed_columns
+        changes.append(
+            "Removed identical columns: "
+            + (", ".join(removed_columns) if removed_columns else "none")
+            + "."
+        )
+
+    # 3. Clean numeric columns.
+    if fill_numeric_missing:
+        numeric_columns = list(
+            result.select_dtypes(include=NUMERIC_TYPES).columns
+        )
+        filled_columns: list[str] = []
+        infinity_columns: list[str] = []
+        skipped_columns: list[str] = []
+
+        for column in numeric_columns:
+            series = result[column].copy()
+            infinite_mask = series.isin([np.inf, -np.inf])
+            infinite_count = int(infinite_mask.sum())
+
+            if infinite_count:
+                series = series.replace([np.inf, -np.inf], np.nan)
+                infinity_columns.append(column)
+                cleaning_summary["infinite_values_replaced"] += infinite_count
+
+            missing_count = int(series.isna().sum())
+
+            if missing_count:
+                if numeric_fill_method == "median":
+                    fill_value = series.median()
+                elif numeric_fill_method == "mean":
+                    fill_value = series.mean()
+                else:
+                    fill_value = numeric_fill_value
+
+                if pd.notna(fill_value) and np.isfinite(float(fill_value)):
+                    # Nullable numeric types can accept these values.
+                    series = series.fillna(fill_value)
+                    filled_columns.append(column)
+                    cleaning_summary["numeric_values_filled"] += missing_count
+                    cleaning_summary["numeric_fill_by_column"][column] = {
+                        "method": numeric_fill_method,
+                        "value": float(fill_value),
+                        "count": missing_count,
+                    }
+                else:
+                    skipped_columns.append(column)
+
+            result[column] = series
+
+        changes.append(
+            f"Replaced infinite numeric values in: "
+            f"{', '.join(infinity_columns) if infinity_columns else 'no columns'}."
+        )
+        changes.append(
+            f"Filled numeric missing values using {numeric_fill_method}: "
+            f"{', '.join(filled_columns) if filled_columns else 'no columns needed filling'}."
+        )
+
+        if skipped_columns:
+            changes.append(
+                "Could not calculate a finite fill value for: "
+                + ", ".join(skipped_columns)
+                + ". These columns may still contain missing values."
+            )
+
+    # 4. Clean categorical columns.
+    if fill_categorical_missing:
+        categorical_columns = list(
+            result.select_dtypes(include=CATEGORICAL_TYPES).columns
+        )
+        filled_columns: list[str] = []
+
+        for column in categorical_columns:
+            missing_count = int(result[column].isna().sum())
+
+            if not missing_count:
+                continue
+
+            series = result[column].astype("object")
+
+            if categorical_fill_method == "mode":
+                modes = series.dropna().mode()
+                fill_value = modes.iloc[0] if not modes.empty else "Unknown"
+            else:
+                fill_value = "Unknown"
+
+            series = series.fillna(fill_value)
+            result[column] = series
+            filled_columns.append(column)
+
+            cleaning_summary["categorical_values_filled"] += missing_count
+            cleaning_summary["categorical_fill_by_column"][column] = {
+                "method": categorical_fill_method,
+                "value": str(fill_value),
+                "count": missing_count,
+            }
+
+        changes.append(
+            f"Filled categorical missing values using {categorical_fill_method}: "
+            f"{', '.join(filled_columns) if filled_columns else 'no columns needed filling'}."
+        )
+
+    # 5. Extract date features from date-like text columns.
+    if extract_date_features:
+        candidates = list(
+            result.select_dtypes(include=["object", "string"]).columns
+        )
+        created_columns: list[str] = []
+        existing_columns = set(result.columns)
+
+        for column in candidates:
+            values = result[column]
+            nonmissing = values.dropna()
+
+            if nonmissing.empty:
+                continue
+
+            try:
+                parsed = pd.to_datetime(
+                    values,
+                    errors="coerce",
+                    format="mixed",
+                )
+            except (TypeError, ValueError, OverflowError):
+                continue
+
+            parsed_ratio = parsed.loc[nonmissing.index].notna().mean()
+
+            if parsed_ratio < 0.8:
+                continue
+
+            prefix = column[:40]
+            date_parts = {
+                "year": parsed.dt.year,
+                "month": parsed.dt.month,
+                "day": parsed.dt.day,
+                "day_of_week": parsed.dt.dayofweek,
+            }
+
+            for part_name, values_series in date_parts.items():
+                new_name = _unique_column_name(
+                    f"{prefix}_{part_name}",
+                    existing_columns,
+                )
+                result[new_name] = values_series
+                created_columns.append(new_name)
+
+        changes.append(
+            "Created date features: "
+            + (
+                ", ".join(created_columns)
+                if created_columns
+                else "no columns met the date-detection threshold"
+            )
+            + "."
+        )
+
+    # 6. One-hot encode categorical columns.
+    if encode_categoricals:
+        categorical_columns = list(
+            result.select_dtypes(include=CATEGORICAL_TYPES).columns
+        )
+
+        if categorical_columns:
+            result = pd.get_dummies(
+                result,
+                columns=categorical_columns,
+                dummy_na=False,
+                dtype=int,
+            )
+            changes.append(
+                f"One-hot encoded {len(categorical_columns)} categorical column(s)."
+            )
+        else:
+            changes.append("No categorical columns needed encoding.")
+
+    # 7. Build the summary.
+    missing_values = _missing_summary(result)
+    numeric_columns = list(
+        result.select_dtypes(include=NUMERIC_TYPES).columns
+    )
+    numeric_summary: dict[str, dict[str, int | float | None]] = {}
+
+    for column in numeric_columns:
+        series = pd.to_numeric(result[column], errors="coerce")
+        series = series.replace([np.inf, -np.inf], np.nan).dropna()
+
+        numeric_summary[column] = {
+            "count": int(series.count()),
+            "mean": _json_safe_number(series.mean()),
+            "median": _json_safe_number(series.median()),
+            "minimum": _json_safe_number(series.min()),
+            "maximum": _json_safe_number(series.max()),
+            "standard_deviation": _json_safe_number(series.std()),
+        }
+
+    summary: dict[str, Any] = {
+        "original_shape": {
+            "rows": int(original_rows),
+            "columns": int(original_columns),
+        },
+        "transformed_shape": {
+            "rows": int(result.shape[0]),
+            "columns": int(result.shape[1]),
+        },
+        "columns": list(result.columns),
+        "remaining_missing_values": missing_values,
+        "remaining_missing_cells": int(result.isna().sum().sum()),
+        "duplicate_rows_remaining": int(result.duplicated().sum()),
+        "numeric_columns": numeric_columns,
+        "numeric_summary": numeric_summary,
+        "cleaning_summary": cleaning_summary,
+        "changes": changes,
+        "options_applied": {
+            "drop_duplicates": drop_duplicates,
+            "fill_numeric_missing": fill_numeric_missing,
+            "fill_categorical_missing": fill_categorical_missing,
+            "encode_categoricals": encode_categoricals,
+            "extract_date_features": extract_date_features,
+            "numeric_fill_method": numeric_fill_method,
+            "numeric_fill_value": numeric_fill_value,
+            "categorical_fill_method": categorical_fill_method,
+            "drop_identical_columns": drop_identical_columns,
+        },
+        "note": (
+            "The original DataFrame was not modified. Review the transformed "
+            "data before using it for machine learning. For predictive modeling, "
+            "learn imputation and encoding rules from training data only, then "
+            "apply those same rules to validation and test data to avoid data "
+            "leakage. This function does not fit a reusable preprocessing pipeline."
+        ),
+    }
+
+    return result, summary
